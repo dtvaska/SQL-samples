@@ -1,0 +1,182 @@
+/**********************************************************
+******************** PREANALYSIS PHASE ********************
+**********************************************************/
+
+-----------------------------
+-- Checking for duplicates --
+-----------------------------
+SELECT 
+  COUNT(*), COUNT(DISTINCT CASEID)
+FROM convera.CaseStudy
+;
+-- Total Rows: 54482, Unqiue CaseID: 27013
+
+----------------------------------------------------------
+-- Checking random CASEID's to check how the data looks --
+----------------------------------------------------------
+SELECT 
+  *, ROW_NUMBER() OVER(PARTITION BY CASEID ORDER BY INQUEUE_TIMESTAMP) rn
+FROM convera.CaseStudy
+WHERE CASEID = '5006R00001tmawzQAA'
+;
+-- It seems that the same case may return to the queue. Initial idea is to treat multiple occurencies of the same CASEID as a single case.
+
+------------------------------------------------------------------
+-- Checking if the same case can have different priority levels --
+------------------------------------------------------------------
+SELECT 
+  CASEID,
+  PRIORITY,
+  ROW_NUMBER() OVER(PARTITION BY CASEID ORDER BY PRIORITY) AS rn
+FROM convera.CaseStudy
+GROUP BY 1, 2
+QUALIFY rn > 1
+;
+-- Same case does not have different priority levels
+
+--------------------------------------------
+-- Cheking for NULL values in the dataset --
+--------------------------------------------
+SELECT *
+FROM convera.CaseStudy
+WHERE CASEID IS NULL
+  OR PRIORITY IS NULL
+  OR INQUEUE_TIMESTAMP IS NULL
+  OR RESPONSE_TIMESTAMP IS NULL
+;
+-- There are no NULL values
+
+---------------------------------------------
+-- Cheking for mistakes in priority naming --
+---------------------------------------------
+
+SELECT PRIORITY
+FROM convera.CaseStudy
+GROUP BY 1
+;
+-- There are no mistakes
+
+---------------------------------------------------------------
+-- Cheking if in queue time is not later than resposnse time --
+---------------------------------------------------------------
+SELECT *
+FROM convera.CaseStudy
+WHERE INQUEUE_TIMESTAMP > RESPONSE_TIMESTAMP
+;
+-- There are no mistakes
+
+
+/*********************************************************
+********************* ANALYSIS PHASE *********************
+**********************************************************/
+
+
+-- response time analysis
+-- Target time: 10 hours, include only cases that hit the queue on weekdays between 9 AM and 5 PM. 
+
+-- Calculate average response time in hours
+-- See if it is influenced by time of day, week or month
+-- Compare different priority response times
+-- Detect amount of outliers by calculating IQR
+-- Determine busiest hours, days, months
+-- See if response times change during busiest periods
+-- Something with cases that return
+
+WITH cte_staging AS (
+  /* This CTE is used to format the data into a more useable format to improve readability of the overall query.
+     Also taking only cases that hit the queue on weekdays between 9 AM and 5 PM */
+  SELECT 
+    CASEID AS CaseID,
+    PRIORITY AS Priority,
+    INQUEUE_TIMESTAMP AS Inqueue,
+    RESPONSE_TIMESTAMP AS Response,
+    EXTRACT(HOUR FROM INQUEUE_TIMESTAMP) AS Inqueue_Hour,
+    EXTRACT(HOUR FROM RESPONSE_TIMESTAMP) AS Response_Hour,
+    TIMESTAMP_DIFF(RESPONSE_TIMESTAMP, INQUEUE_TIMESTAMP, HOUR) AS ResponseToCase_Time
+  FROM convera.CaseStudy
+  WHERE FORMAT_DATETIME('%A', INQUEUE_TIMESTAMP) NOT IN ('Saturday','Sunday')
+    AND EXTRACT(HOUR FROM INQUEUE_TIMESTAMP) BETWEEN 9 AND 16
+),
+
+cte_busyness AS (
+  /* This CTE is calculate TOP 5 busiest hours, busiest hours are defined as hours when most cases hit the queue.
+     This metric will be used determine if there is a difference in reponse time */
+  SELECT 
+    Inqueue_Hour,
+    COUNT(*) AS CaseAmount,
+    ROW_NUMBER() OVER(ORDER BY COUNT(*) DESC) AS busiest_hours
+  FROM cte_staging
+  GROUP BY Inqueue_Hour
+  QUALIFY busiest_hours <= 4
+),
+
+cte_returncases AS (
+  /* This CTE is used to find cases that occure more than once */
+  SELECT CaseID 
+  FROM cte_staging
+  GROUP BY CaseID
+  HAVING COUNT(*) > 1
+),
+
+cte_sameday AS (
+  /* This CTE is used to find cases that have been responded to on the same day until end of working hours */
+  SELECT DISTINCT 
+    CaseID, 
+    Inqueue
+  FROM cte_staging
+  WHERE DATE(Inqueue) = DATE(Response)
+    AND Response_Hour < 17
+),
+
+cte_iqr AS (
+  /* This CTE is used to calculated inner quartile range later to be used to determine response time outliers */
+ SELECT 
+   APPROX_QUANTILES(ResponseToCase_Time, 4)[OFFSET (1)] lower_iqr,
+   APPROX_QUANTILES(ResponseToCase_Time, 4)[OFFSET (2)] AS iqr,
+   APPROX_QUANTILES(ResponseToCase_Time, 4)[OFFSET (3)] upper_iqr,
+ FROM cte_staging
+),
+
+cte_final AS (
+  SELECT 
+    staging.CaseID,
+    staging.Priority,
+    staging.Inqueue,
+    staging.Response,
+    staging.ResponseToCase_Time,
+    CASE WHEN busyness.Inqueue_Hour IS NOT NULL
+         THEN TRUE
+         ELSE FALSE
+      END AS Is_BusiestPeriod,
+    CASE WHEN staging.ResponseToCase_Time <= lower_iqr+iqr*1.5 
+         THEN 'Low Outlier'
+         WHEN staging.ResponseToCase_Time >= upper_iqr+iqr*1.5
+         THEN 'High Outlier'
+         ELSE 'Not Outlier'
+      END Is_Outlier,
+    CASE WHEN staging.ResponseToCase_Time <=10 
+         THEN TRUE
+         ELSE FALSE
+      END Is_WithinTarget,
+    CASE WHEN returncases.CaseID IS NOT NULL
+         THEN TRUE
+         ELSE FALSE 
+      END Is_ReturnCase,
+    CASE WHEN sameday.CaseID IS NOT NULL
+         THEN 1
+         ELSE 0 
+      END Is_RespondedSameDay,
+    ROW_NUMBER() OVER(PARTITION BY staging.CaseID ORDER BY staging.Inqueue) AS CaseReturnOrder
+  FROM cte_staging staging
+  LEFT JOIN cte_busyness busyness
+    ON staging.Inqueue_Hour = busyness.Inqueue_Hour 
+  LEFT JOIN cte_returncases returncases
+    ON staging.CaseId = returncases.CaseID
+  LEFT JOIN cte_sameday sameday
+    ON staging.CaseID = sameday.CaseID
+    AND staging.Inqueue = sameday.Inqueue
+  CROSS JOIN cte_iqr
+)
+
+SELECT *
+FROM cte_final
